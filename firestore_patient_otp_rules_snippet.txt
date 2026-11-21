@@ -1,0 +1,30 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Patient profile creation is server-only through finalizePatientRegistration.
+    // Patients can read their own profile. Profile updates are restricted to
+    // editable contact/profile fields; role, status, UID and verification flags
+    // cannot be changed by the client.
+    match /patients/{patientId} {
+      allow read: if request.auth != null && request.auth.uid == patientId;
+
+      allow create, delete: if false;
+
+      allow update: if request.auth != null
+        && request.auth.uid == patientId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name',
+          'fullName',
+          'address',
+          'phone',
+          'phoneNumber',
+          'updatedAt'
+        ]);
+    }
+
+    // OTP documents are private to Admin SDK Cloud Functions.
+    match /emailOtps/{documentId} {
+      allow read, write: if false;
+    }
+  }
+}

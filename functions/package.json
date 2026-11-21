@@ -1,0 +1,17 @@
+{
+  "name": "alapot-dental-functions",
+  "description": "Alapot Dental Clinic optional automatic receipt trigger (email verification and patient linking use Firebase Auth and Firestore directly)",
+  "private": true,
+  "engines": {
+    "node": "22"
+  },
+  "main": "index.js",
+  "scripts": {
+    "serve": "firebase emulators:start --only functions",
+    "deploy": "firebase deploy --only functions"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.5.0",
+    "firebase-functions": "^6.4.0"
+  }
+}

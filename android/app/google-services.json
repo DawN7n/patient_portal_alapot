@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "275460468756",
+    "project_id": "alapot-dental-clinic-5ea90",
+    "storage_bucket": "alapot-dental-clinic-5ea90.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:275460468756:android:bafb6245c7f724dd387701",
+        "android_client_info": {
+          "package_name": "com.example.patient_portal_alapot"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBplW2Rto6q-GBs03XWWWh-9so3ExR-jcY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

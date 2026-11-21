@@ -1,0 +1,126 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+
+class AuthService {
+  AuthService({
+    FirebaseAuth? auth,
+    FirebaseFirestore? firestore,
+    FirebaseFunctions? functions,
+  })  : _auth = auth ?? FirebaseAuth.instance,
+        _firestore = firestore ?? FirebaseFirestore.instance,
+        _functions = functions ??
+            FirebaseFunctions.instanceFor(region: 'asia-southeast1');
+
+  final FirebaseAuth _auth;
+  final FirebaseFirestore _firestore;
+  final FirebaseFunctions _functions;
+
+  Future<void> sendRegistrationOtp(String email) async {
+    final callable = _functions.httpsCallable('sendRegistrationOtp');
+    await callable.call(<String, dynamic>{'email': email.trim().toLowerCase()});
+  }
+
+  Future<void> verifyRegistrationOtp({
+    required String email,
+    required String code,
+  }) async {
+    final callable = _functions.httpsCallable('verifyRegistrationOtp');
+    await callable.call(<String, dynamic>{
+      'email': email.trim().toLowerCase(),
+      'code': code.trim(),
+    });
+  }
+
+  Future<User> registerPatient({
+    required String email,
+    required String password,
+    required String otp,
+    required Map<String, dynamic> profile,
+  }) async {
+    await verifyRegistrationOtp(email: email, code: otp);
+
+    UserCredential? credential;
+    try {
+      credential = await _auth.createUserWithEmailAndPassword(
+        email: email.trim().toLowerCase(),
+        password: password,
+      );
+
+      final user = credential.user;
+      if (user == null) {
+        throw StateError('Firebase did not return a newly created account.');
+      }
+
+      await user.updateDisplayName(profile['name']?.toString());
+      try {
+        await _functions.httpsCallable('finalizePatientRegistration').call(
+          <String, dynamic>{
+            'email': email.trim().toLowerCase(),
+            'profile': profile,
+          },
+        );
+      } catch (_) {
+        // A callable response can be lost after the server has committed.
+        // Check the canonical patient document before rolling back Auth.
+        final committedProfile =
+            await _firestore.collection('patients').doc(user.uid).get();
+        if (!committedProfile.exists) rethrow;
+      }
+
+      await user.reload();
+      return _auth.currentUser ?? user;
+    } catch (_) {
+      // Roll back the just-created Auth user if the server could not create
+      // the corresponding patient profile. The OTP remains valid briefly,
+      // allowing the patient to retry after a transient failure.
+      try {
+        await credential?.user?.delete();
+      } catch (_) {
+        // Do not hide the original registration error.
+      }
+      rethrow;
+    }
+  }
+
+  Future<String> signInPatient({
+    required String email,
+    required String password,
+  }) async {
+    final credential = await _auth.signInWithEmailAndPassword(
+      email: email.trim().toLowerCase(),
+      password: password,
+    );
+
+    final user = credential.user;
+    if (user == null) {
+      throw StateError('Unable to sign in. Please try again.');
+    }
+
+    final patientSnapshot =
+        await _firestore.collection('patients').doc(user.uid).get();
+
+    if (!patientSnapshot.exists) {
+      await _auth.signOut();
+      throw StateError(
+        'This account does not have a patient profile. Please contact the clinic.',
+      );
+    }
+
+    final data = patientSnapshot.data() ?? <String, dynamic>{};
+    if (data['status']?.toString().toLowerCase() == 'disabled') {
+      await _auth.signOut();
+      throw StateError('This patient account is currently disabled.');
+    }
+
+    return (data['name'] ?? user.displayName ?? 'Patient').toString();
+  }
+
+  Future<void> sendPasswordReset(String email) async {
+    await _auth.sendPasswordResetEmail(email: email.trim().toLowerCase());
+  }
+
+  Future<void> signOut() => _auth.signOut();
+
+  User? get currentUser => _auth.currentUser;
+}

@@ -1,0 +1,9 @@
+Options -Indexes
+
+<Files "alapot_ai_core.php">
+    Require all denied
+</Files>
+
+<FilesMatch "^(\.env|environment\.example)$">
+    Require all denied
+</FilesMatch>

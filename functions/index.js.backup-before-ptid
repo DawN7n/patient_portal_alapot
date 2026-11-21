@@ -1,0 +1,342 @@
+const crypto = require("node:crypto");
+const { initializeApp } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
+const { getFirestore, FieldValue, Timestamp } = require("firebase-admin/firestore");
+const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
+
+initializeApp();
+
+const db = getFirestore();
+const RESEND_API_KEY = defineSecret("RESEND_API_KEY");
+const RESEND_FROM_EMAIL = defineSecret("RESEND_FROM_EMAIL");
+const OTP_HASH_SECRET = defineSecret("OTP_HASH_SECRET");
+
+const REGION = "asia-southeast1";
+const OTP_LIFETIME_MS = 10 * 60 * 1000;
+const VERIFIED_LIFETIME_MS = 15 * 60 * 1000;
+const RESEND_COOLDOWN_MS = 60 * 1000;
+const MAX_DAILY_SENDS = 5;
+const MAX_VERIFY_ATTEMPTS = 5;
+
+function normalizeEmail(value) {
+  if (typeof value !== "string") {
+    throw new HttpsError("invalid-argument", "A valid email address is required.");
+  }
+  const email = value.trim().toLowerCase();
+  if (
+    email.length > 254 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  ) {
+    throw new HttpsError("invalid-argument", "Enter a valid email address.");
+  }
+  return email;
+}
+
+function emailDocumentId(email) {
+  return crypto.createHash("sha256").update(email).digest("hex");
+}
+
+function hashOtp(email, code) {
+  return crypto
+    .createHmac("sha256", OTP_HASH_SECRET.value())
+    .update(`${email}:${code}`)
+    .digest("hex");
+}
+
+function secureEqualHex(left, right) {
+  try {
+    const a = Buffer.from(left, "hex");
+    const b = Buffer.from(right, "hex");
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (_) {
+    return false;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+exports.sendRegistrationOtp = onCall(
+  {
+    region: REGION,
+    secrets: [RESEND_API_KEY, RESEND_FROM_EMAIL, OTP_HASH_SECRET],
+    timeoutSeconds: 30,
+  },
+  async (request) => {
+    const email = normalizeEmail(request.data?.email);
+
+    try {
+      await getAuth().getUserByEmail(email);
+      throw new HttpsError(
+        "already-exists",
+        "An account with this email already exists. Please log in."
+      );
+    } catch (error) {
+      if (error instanceof HttpsError) throw error;
+      if (error.code !== "auth/user-not-found") throw error;
+    }
+
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+    const id = emailDocumentId(email);
+    const ref = db.collection("emailOtps").doc(id);
+    const now = Date.now();
+    const dateKey = new Date(now).toISOString().slice(0, 10);
+    const otpHash = hashOtp(email, code);
+
+    const reservation = await db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(ref);
+      const previous = snapshot.exists ? snapshot.data() : {};
+      const lastSentAt = previous.lastSentAt?.toMillis?.() ?? 0;
+
+      if (now - lastSentAt < RESEND_COOLDOWN_MS) {
+        return { status: "cooldown" };
+      }
+
+      const sendsToday =
+        previous.sendDate === dateKey ? Number(previous.sendsToday || 0) : 0;
+
+      if (sendsToday >= MAX_DAILY_SENDS) {
+        return { status: "daily-limit" };
+      }
+
+      transaction.set(ref, {
+        email,
+        otpHash,
+        expiresAt: Timestamp.fromMillis(now + OTP_LIFETIME_MS),
+        verified: false,
+        verifiedUntil: null,
+        consumed: false,
+        attempts: 0,
+        lastSentAt: Timestamp.fromMillis(now),
+        sendDate: dateKey,
+        sendsToday: sendsToday + 1,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      return { status: "ok" };
+    });
+
+    if (reservation.status === "cooldown") {
+      throw new HttpsError(
+        "resource-exhausted",
+        "Please wait 60 seconds before requesting another code."
+      );
+    }
+    if (reservation.status === "daily-limit") {
+      throw new HttpsError(
+        "resource-exhausted",
+        "You have reached the daily verification email limit. Try again tomorrow."
+      );
+    }
+
+    const safeEmail = escapeHtml(email);
+    const html = `
+      <div style="margin:0;padding:32px 12px;background:#f4f9f9;font-family:Arial,sans-serif;color:#183b40">
+        <div style="max-width:520px;margin:0 auto;padding:32px;background:#ffffff;border-radius:18px">
+          <p style="margin:0 0 8px;color:#0795a5;font-size:13px;font-weight:700;letter-spacing:1px">ALAPOT DENTAL CLINIC</p>
+          <h1 style="margin:0 0 12px;font-size:24px">Verify your email</h1>
+          <p style="line-height:1.6;color:#5d7073">Use this one-time code to continue creating your patient account for ${safeEmail}.</p>
+          <div style="margin:28px 0;padding:18px;text-align:center;background:#eef8f8;border-radius:12px;font-size:34px;font-weight:700;letter-spacing:10px;color:#087f8c">${code}</div>
+          <p style="line-height:1.6;color:#5d7073">This code expires in 10 minutes. Do not share it with anyone, including clinic staff.</p>
+          <p style="margin-top:28px;font-size:12px;color:#91a1a3">If you did not request this code, you can safely ignore this email.</p>
+        </div>
+      </div>`;
+
+    const resendResponse = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY.value()}`,
+        "Content-Type": "application/json",
+        "Idempotency-Key": `alapot-registration-otp-${crypto.randomUUID()}`,
+      },
+      body: JSON.stringify({
+        from: RESEND_FROM_EMAIL.value(),
+        to: [email],
+        subject: "Your Alapot Dental Clinic verification code",
+        html,
+        text: `Your Alapot Dental Clinic verification code is ${code}. It expires in 10 minutes. Do not share this code.`,
+      }),
+    });
+
+    if (!resendResponse.ok) {
+      const responseText = await resendResponse.text();
+      await ref.delete();
+      console.error("Resend API error:", resendResponse.status, responseText);
+      throw new HttpsError(
+        "internal",
+        "We could not send the verification email. Please try again shortly."
+      );
+    }
+
+    return { success: true, message: "Verification code sent." };
+  }
+);
+
+exports.verifyRegistrationOtp = onCall(
+  {
+    region: REGION,
+    secrets: [OTP_HASH_SECRET],
+  },
+  async (request) => {
+    const email = normalizeEmail(request.data?.email);
+    const code = String(request.data?.code ?? "").trim();
+
+    if (!/^\d{6}$/.test(code)) {
+      throw new HttpsError("invalid-argument", "Enter the 6-digit code.");
+    }
+
+    const ref = db.collection("emailOtps").doc(emailDocumentId(email));
+    const now = Date.now();
+
+    const result = await db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(ref);
+      if (!snapshot.exists) return "missing";
+
+      const record = snapshot.data();
+      if (record.consumed === true) return "consumed";
+
+      const verifiedUntil = record.verifiedUntil?.toMillis?.() ?? 0;
+      if (record.verified === true && verifiedUntil > now) return "verified";
+
+      const expiresAt = record.expiresAt?.toMillis?.() ?? 0;
+      if (expiresAt <= now) return "expired";
+
+      const attempts = Number(record.attempts || 0);
+      if (attempts >= MAX_VERIFY_ATTEMPTS) return "locked";
+
+      const expectedHash = hashOtp(email, code);
+      if (!secureEqualHex(expectedHash, String(record.otpHash || ""))) {
+        transaction.update(ref, {
+          attempts: attempts + 1,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        return attempts + 1 >= MAX_VERIFY_ATTEMPTS ? "locked" : "invalid";
+      }
+
+      transaction.update(ref, {
+        verified: true,
+        verifiedAt: FieldValue.serverTimestamp(),
+        verifiedUntil: Timestamp.fromMillis(now + VERIFIED_LIFETIME_MS),
+        otpHash: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      return "verified";
+    });
+
+    if (result === "verified") {
+      return { success: true, message: "Email verified." };
+    }
+    if (result === "missing") {
+      throw new HttpsError("not-found", "Request a verification code first.");
+    }
+    if (result === "expired") {
+      throw new HttpsError("failed-precondition", "The code has expired. Request a new one.");
+    }
+    if (result === "locked" || result === "consumed") {
+      throw new HttpsError("permission-denied", "Verification is locked or already used. Request a new code.");
+    }
+    throw new HttpsError("permission-denied", "The verification code is incorrect.");
+  }
+);
+
+exports.finalizePatientRegistration = onCall(
+  {
+    region: REGION,
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Please sign in to finish registration.");
+    }
+
+    const uid = request.auth.uid;
+    const authEmail = normalizeEmail(request.auth.token.email);
+    const email = normalizeEmail(request.data?.email);
+
+    if (email !== authEmail) {
+      throw new HttpsError("permission-denied", "The verified email does not match this account.");
+    }
+
+    const profile = request.data?.profile || {};
+    const fullName = String(profile.name || "").trim();
+    const dob = String(profile.dob || "").trim();
+    const gender = String(profile.gender || "").trim();
+    const address = String(profile.address || "").trim();
+    const phone = String(profile.phone || "").trim();
+
+    if (
+      fullName.length < 2 || fullName.length > 120 ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(dob) ||
+      !["Male", "Female"].includes(gender) ||
+      address.length < 3 || address.length > 500 ||
+      phone.length < 8 || phone.length > 30
+    ) {
+      throw new HttpsError("invalid-argument", "Some patient profile details are invalid.");
+    }
+
+    const otpRef = db.collection("emailOtps").doc(emailDocumentId(email));
+    const patientRef = db.collection("patients").doc(uid);
+    const now = Date.now();
+
+    await getAuth().updateUser(uid, {
+      emailVerified: true,
+      displayName: fullName,
+    });
+
+    await db.runTransaction(async (transaction) => {
+      const otpSnapshot = await transaction.get(otpRef);
+      const patientSnapshot = await transaction.get(patientRef);
+
+      if (patientSnapshot.exists) {
+        throw new HttpsError("already-exists", "A patient profile already exists.");
+      }
+      if (!otpSnapshot.exists) {
+        throw new HttpsError("failed-precondition", "Email verification was not found.");
+      }
+
+      const otp = otpSnapshot.data();
+      const verifiedUntil = otp.verifiedUntil?.toMillis?.() ?? 0;
+
+      if (otp.verified !== true || otp.consumed === true || verifiedUntil <= now) {
+        throw new HttpsError("failed-precondition", "Please verify your email again.");
+      }
+
+      const registeredDate = new Date().toISOString().slice(0, 10);
+      transaction.create(patientRef, {
+        id: uid,
+        uid,
+        role: "patient",
+        name: fullName,
+        fullName,
+        dob,
+        dateOfBirth: dob,
+        gender,
+        address,
+        phone,
+        phoneNumber: phone,
+        email,
+        emailVerified: true,
+        emailOtpVerified: true,
+        status: "active",
+        registered: registeredDate,
+        registeredAt: FieldValue.serverTimestamp(),
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      transaction.update(otpRef, {
+        consumed: true,
+        consumedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    });
+
+    return { success: true, patientId: uid };
+  }
+);

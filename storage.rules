@@ -1,0 +1,14 @@
+﻿rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() { return request.auth != null; }
+    function userDoc() { return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)); }
+    function isAdmin() { return signedIn() && userDoc().data.role == 'admin' && (!userDoc().data.keys().hasAny(['active']) || userDoc().data.active == true); }
+    function isPatientOwner(patientUid) { return signedIn() && request.auth.uid == patientUid && userDoc().data.role == 'patient' && userDoc().data.active == true; }
+    match /support-ticket-attachments/{patientUid}/{ticketId}/{fileName} {
+      allow read: if isAdmin() || isPatientOwner(patientUid);
+      allow create, update: if isPatientOwner(patientUid) && request.resource.size <= 5 * 1024 * 1024 && request.resource.contentType.matches('image/(jpeg|png|webp)');
+      allow delete: if isAdmin() || isPatientOwner(patientUid);
+    }
+  }
+}

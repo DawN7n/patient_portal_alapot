@@ -1,0 +1,4 @@
+# Configure these as SERVER environment variables in your hosting control panel.
+# Do not upload a real key in this file or commit it to source control.
+ALAPOT_GROQ_API_KEY=PASTE_YOUR_NEW_ROTATED_GROQ_KEY_IN_SERVER_SETTINGS
+ALAPOT_GROQ_MODEL=openai/gpt-oss-20b
